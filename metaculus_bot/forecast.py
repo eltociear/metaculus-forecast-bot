@@ -180,10 +180,16 @@ def _request(url: str, *, method: str = "GET", headers: dict | None = None,
 def metaculus_headers() -> dict:
     token = os.getenv("METACULUS_TOKEN")
     if not token:
+        # ⚠ This used to end "copy the token from /futureeval/participate/". The token is NOT
+        # on that page — it shows a three-step panel whose own step 1 sends you to your
+        # settings page. Someone followed the old wording, landed somewhere with no token,
+        # and came back. Wrong instructions cost more than missing ones, and this text is
+        # published, so it says where the token actually is.
         raise SystemExit(
             "METACULUS_TOKEN is not set.\n"
-            "Create a bot account at https://www.metaculus.com/aib (\"Create a Bot Account\")\n"
-            "then copy the token from https://www.metaculus.com/futureeval/participate/"
+            "Create a bot account at https://www.metaculus.com/aib (\"Create a Bot Account\").\n"
+            "You are redirected to your SETTINGS page: create the bot there and copy the\n"
+            "access token it shows. Copy it immediately — it is displayed once."
         )
     return {"Authorization": f"Token {token}"}
 
