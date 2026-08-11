@@ -81,6 +81,19 @@ The page size is capped at 100 however much you ask for, and the `next` link sta
 past the last page — so "follow `next` until it is null" never terminates. Stop on an empty
 batch.
 
+Measured 2026-08-11 against a corpus of thousands, because "I asked for 500 and got 26" only
+proves the corpus was small:
+
+```
+asked   99 -> got  99      # under the cap, honoured exactly
+asked  100 -> got 100
+asked  101 -> got 100      # the wall
+asked 1000 -> got 100
+```
+
+And walking a 26-post tournament to its end: `offset=26` returns 0 results with `next` still
+set, and so does `offset=226`. There is no null to wait for.
+
 ## Files
 
 | file | what it does |
