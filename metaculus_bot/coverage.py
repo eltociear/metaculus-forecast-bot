@@ -76,6 +76,12 @@ FUNDED = [("minibench", "MiniBench", "$1,000", 33074),
 OUR_USER_ID = 301182   # eltociear_bot; leaderboard entries carry user.id
 
 
+def _strip_ansi(s: str) -> str:
+    """The standing string is coloured for the terminal; JSON should not carry escapes."""
+    import re as _re
+    return _re.sub(r"\033\[[0-9;]*m", "", s)
+
+
 def load_env() -> None:
     """The GitHub Action injects METACULUS_TOKEN; locally it lives in .env."""
     if os.getenv("METACULUS_TOKEN"):
@@ -395,7 +401,8 @@ def main() -> int:
             print(f"  \033[33mUNKNOWN: {len(unknown)}\033[0m  - the {budget_started_at}-question "
                   f"detail budget ran out, so these were never checked. They are NOT counted "
                   f"as covered. Re-run with --full to settle them.")
-        print(f"  standing: {leaderboard(tid, numeric_id)}")
+        standing = leaderboard(tid, numeric_id)
+        print(f"  standing: {standing}")
 
         # Closing soonest first: an unforecast question that closes in 6 hours is the one
         # that is actually about to be lost.
@@ -419,6 +426,9 @@ def main() -> int:
             "open": len(posts), "forecast": len(done), "unforecast": len(missing),
             "unknown": len(unknown), "checked": checked,
             "coveragePct": pct,
+            # Persisted so the blitz can show it without re-fetching, and so "we appeared on
+            # a board" is visible as a CHANGE rather than something you have to notice.
+            "standing": _strip_ansi(standing), "botStatus": status,
             # Only ids we CONFIRMED forecast AND that have no window left to open, so the
             # next run's cache can never inherit a guess or freeze a post whose next
             # subquestion is still coming. An unknown stays unknown until something checks it.
