@@ -150,19 +150,29 @@ def leaderboard(tid, numeric_id=None) -> str:
     except Exception as e:  # noqa: BLE001
         return f"unreadable ({getattr(e, 'code', '?')})"
     board = (d if isinstance(d, list) else [d])[0] if d else {}
-    entries = board.get("entries") or []
-    if not entries:
+    raw = board.get("entries") or []
+    if not raw:
         return "board not computed yet (0 entries)"
+    # A board mixes competitors with aggregation rows (user=null), Metaculus' own house bots
+    # (metac-*), research-only entries and secondary bots from one operator. On FutureEval
+    # that is 79 of 199 rows. Counting them makes the field look bigger and our odds worse,
+    # and makes an excluded high scorer look like somebody who was denied a prize.
+    entries = [e for e in raw if e.get("exclusion_status") == 0]
+    if not entries:
+        return f"{len(raw)} rows, none prize-eligible"
     paid = [e for e in entries if e.get("prize")]
     floor = f", smallest prize ${min(e['prize'] for e in paid):.0f}" if paid else ""
+    # The cutoff is volume: the cheapest way in is to have scored on enough questions.
+    cut = (min((e.get("contribution_count") or 0) for e in paid) if paid else None)
+    bar = f", money starts at {cut} scored question(s)" if cut else ""
     mine = [e for e in entries if (e.get("user") or {}).get("id") == OUR_USER_ID]
     if mine:
         e = mine[0]
         return (f"\033[32mrank {e.get('rank')} of {len(entries)}\033[0m, "
                 f"score {e.get('score')}, on track for ${e.get('prize') or 0:.2f} "
                 f"({len(paid)} of {len(entries)} are paid{floor})")
-    return (f"\033[33mnot on the board\033[0m  - {len(entries)} entrants, "
-            f"{len(paid)} paid{floor}, top coverage {max((e.get('coverage') or 0) for e in entries):g}")
+    return (f"\033[33mnot on the board\033[0m  - {len(entries)} eligible entrants "
+            f"(of {len(raw)} rows), {len(paid)} paid{floor}{bar}")
 
 
 def brief(post: dict) -> None:
