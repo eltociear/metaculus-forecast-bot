@@ -46,6 +46,12 @@ Input is a JSON file mapping post id -> forecast, in the shape the question type
   python3 scripts/metaculus_bot/submit_manual.py forecasts.json --dry-run
   python3 scripts/metaculus_bot/submit_manual.py forecasts.json --submit
   python3 scripts/metaculus_bot/submit_manual.py forecasts.json --submit --force
+  python3 scripts/metaculus_bot/submit_manual.py forecasts.json --validate
+
+`--validate` builds every payload against the question's CURRENT scale and runs `validate_cdf`
+on it WITHOUT submitting and without waiting for the window. A queued forecast is written
+against a grid read weeks earlier; if Metaculus adjusts a range or an option list before the
+window opens, the ordinary path finds out only at submit time and drops the question silently.
 
 A question we have already forecast is skipped, so the file is safe to run on a schedule —
 the cron runs it every three hours and a standing forecast does not need re-POSTing. Pass
@@ -121,6 +127,7 @@ def main() -> int:
         return 2
     submit = "--submit" in sys.argv
     force = "--force" in sys.argv
+    validate_only = "--validate" in sys.argv
     path = Path(args[0])
     plan = json.loads(path.read_text(encoding="utf-8"))
 
@@ -159,6 +166,34 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 return None
         opens, closes = _at(question.get("open_time")), _at(question.get("scheduled_close_time"))
+        # --validate builds and checks the payload against the question's CURRENT scale
+        # without submitting, and it runs BEFORE the window test on purpose. A forecast
+        # written weeks ahead is checked against a grid read weeks ago; if Metaculus adjusts
+        # the range or the option list before the window opens, the ordinary path would
+        # discover that only at submit time, silently dropping a question from a position
+        # that is sitting on the pay threshold.
+        if validate_only:
+            forecast, qtype, err = build(entry, question)
+            if err:
+                print(f"    \033[31mWOULD FAIL\033[0m: {err}")
+                failed += 1
+                continue
+            payload = create_forecast_payload(forecast, qtype)
+            if payload["continuous_cdf"] is not None:
+                problem = validate_cdf(payload["continuous_cdf"], question)
+                if problem:
+                    print(f"    \033[31mWOULD FAIL\033[0m: CDF rejected ({problem})")
+                    failed += 1
+                    continue
+                sc = question.get("scaling") or {}
+                print(f"    \033[32mvalid\033[0m  {len(payload['continuous_cdf'])}-point cdf on "
+                      f"[{sc.get('range_min')}, {sc.get('range_max')}]")
+            else:
+                shown = payload["probability_yes"] or payload["probability_yes_per_category"]
+                print(f"    \033[32mvalid\033[0m  {qtype}: "
+                      f"{json.dumps(shown) if not isinstance(shown, float) else f'{shown:.3f}'}")
+            ok += 1
+            continue
         if opens and opens > now:
             print(f"    \033[36mnot open yet\033[0m — opens {opens:%Y-%m-%d %H:%M}Z "
                   f"({(opens - now).total_seconds() / 3600:.1f}h). Re-run this same file then.")
@@ -227,9 +262,13 @@ def main() -> int:
             print(f"    SUBMIT FAILED: {e}")
             failed += 1
 
-    if submit:
+    if submit and not validate_only:
         save_ledger(ledger)
-    print(f"\n=== submitted {ok}, failed {failed}, skipped {skipped} ===")
+    # Say what actually happened. In --validate mode nothing was sent, and reporting
+    # "submitted 29" for a run that submitted nothing is the same class of false label this
+    # repo spent a day removing from its own instruments.
+    verb = "validated" if validate_only else "submitted"
+    print(f"\n=== {verb} {ok}, failed {failed}, skipped {skipped} ===")
     return 1 if failed else 0
 
 
