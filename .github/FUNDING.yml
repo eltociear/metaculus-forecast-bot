@@ -1,0 +1,11 @@
+# `github:` is deliberately absent: GitHub Sponsors is not enabled on this account, confirmed
+# by API (`sponsorsListing: null`, 0 sponsors) and by fetching github.com/sponsors/eltociear,
+# which renders an ordinary profile with no tiers. A `github:` entry renders a Sponsor button
+# that leads nowhere, which is worse than no button.
+#
+# Every link below returned 200 on 2026-08-11. Re-check with a fetch before adding one.
+custom:
+  - "https://buy.polar.sh/polar_cl_sut9rtngBRutEhBAGk1FmwRYSLrAebowkPw8g2C5Op7"  # MCP Security Audit Report, $5
+  - "https://buy.polar.sh/polar_cl_jKHyL3Ge9u5YGAsjgixp16UYrhU0WGldxvRmN03expZ"  # Security Pulse — Monthly MCP Vuln Briefing, $5
+  - "https://buy.polar.sh/polar_cl_C37THjfoFMdOnu6xc1TnMIezYNuBbbivXbvFb3DCpZa"  # Pro Audit Stack — MCP CI Power-User, $20
+  - "https://buymeacoffee.com/eltociear"
