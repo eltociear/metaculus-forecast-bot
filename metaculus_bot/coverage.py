@@ -202,11 +202,17 @@ def list_all_open_posts(tid) -> list[dict]:
 _TOURNAMENT_INDEX: dict | None = None
 
 
-def prize_status(tid) -> tuple[str, str]:
-    """(bot_leaderboard_status, pool) for a tournament, read live.
+def prize_status(tid, sample_post: dict | None = None) -> tuple[str, str]:
+    """(bot_leaderboard_status, pool), read live.
 
     Forecasting into a tournament that excludes bots earns exactly nothing, and nothing in
     the repo checked this until 25 Cup forecasts had already been placed. It is one field.
+
+    `/projects/tournaments/` is not enough on its own: MiniBench is `type: question_series`
+    and is absent from those 193 entries, so it read as "unknown" forever — while being
+    `include` with a $1,000 pool, i.e. the very tournament we were submitting to. There is
+    no endpoint that lists question series (every guess 404s), so the fallback is a post's
+    own `projects` block, which carries the same fields and is authoritative.
     """
     global _TOURNAMENT_INDEX
     if _TOURNAMENT_INDEX is None:
@@ -220,6 +226,16 @@ def prize_status(tid) -> tuple[str, str]:
         except Exception:  # noqa: BLE001 - unknown eligibility must not stop the count
             pass
     t = _TOURNAMENT_INDEX.get(str(tid)) or {}
+    if not t and sample_post:
+        for entries in (sample_post.get("projects") or {}).values():
+            for cand in (entries if isinstance(entries, list) else [entries]):
+                if not isinstance(cand, dict):
+                    continue
+                if str(cand.get("id")) == str(tid) or str(cand.get("slug")) == str(tid):
+                    t = cand
+                    break
+            if t:
+                break
     return t.get("bot_leaderboard_status") or "unknown", t.get("prize_pool") or "?"
 
 
@@ -332,7 +348,7 @@ def main() -> int:
         pct = 100 * len(done) // max(checked, 1)
         colour = "\033[32m" if pct >= 90 and not unknown else ("\033[33m" if pct >= 50 else "\033[31m")
 
-        status, pool = prize_status(tid)
+        status, pool = prize_status(tid, posts[0] if posts else None)
         # "unknown" means the tournament list did not carry this id — MiniBench is addressed
         # by a slug the index does not key on. Never render that as EXCLUDED: a false
         # "no prize" on a paying tournament is exactly the error that would make a later
