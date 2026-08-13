@@ -110,6 +110,11 @@ HF_402_BACKOFF_SECONDS = 60
 # covers the ~90s window; capping it stops a sustained window from wedging a call for minutes.
 HF_402_MAX_WAITS = 2
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+# BlockRun's free NVIDIA tier: an OpenAI open-weight 120B, paid by wallet SIGNATURE only ($0
+# charged), pinned to a free `nvidia/*` model so smart-routing can never pick a paid one. This
+# is the backend that keeps the bot alive while HF's free tier is depleted (canPay:false until
+# ~2026-09-01) — no operator email, no USDC, no HF quota. Override with BLOCKRUN_MODEL.
+BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
 
 
 # --------------------------------------------------------------------------- env
@@ -254,6 +259,25 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
             # transient one. Fall through to HuggingFace rather than abandoning the run.
             body = e.read().decode(errors="replace")[:200] if hasattr(e, "read") else ""
             print(f"    metaculus proxy unusable ({e.code}): {body}")
+
+    # BlockRun free NVIDIA tier (blockrun_llm SDK, x402 wallet-signature auth, $0 on nvidia/*
+    # models). Wired ahead of HF because HF's free tier is depleted until ~2026-09-01, so this
+    # is what actually forecasts during the outage — no operator email, no USDC, no HF quota.
+    # Reuses the on-chain wallet key we already hold. On any failure (SDK missing, network,
+    # model EOL) it falls through to HF rather than aborting the run.
+    blockrun_key = os.getenv("BLOCKRUN_WALLET_KEY") or os.getenv("BASE_WALLET_PRIVATE_KEY")
+    if blockrun_key:
+        try:
+            from blockrun_llm import LLMClient  # noqa: E402 - optional backend, imported lazily
+            text = LLMClient(private_key=blockrun_key).chat(
+                BLOCKRUN_MODEL, prompt, temperature=temperature, max_tokens=max_tokens)
+            if text and text.strip():
+                return text
+            print("    blockrun returned empty; falling through to HF")
+        except ImportError:
+            pass  # SDK not installed here; use HF
+        except Exception as e:  # noqa: BLE001 - any backend error: fall through to HF
+            print(f"    blockrun unusable ({type(e).__name__}): {str(e)[:120]}")
 
     # Both tokens, in preference order. This used to read `A or B`, so B was only ever a
     # default for when A was unset, never a fallback for when A stopped working. They turn
