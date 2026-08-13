@@ -31,6 +31,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Force UTF-8 stdout so the em-dash/box-drawing status lines don't crash a Windows cp932 console
+# when the operator runs coverage.py directly; no-op where stdout is already UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forecast import (  # noqa: E402  - sibling module, path fixed just above
     API_BASE_URL,
