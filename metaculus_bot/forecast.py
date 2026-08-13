@@ -48,6 +48,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Status lines print em-dashes and arrows. A Windows console (cp932/cp1252) raises
+# UnicodeEncodeError on the first such character and kills the run — including an operator's
+# `--submit`. Force UTF-8 so a real terminal behaves like the pipe/CI path; no-op where already UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 API_BASE_URL = "https://www.metaculus.com/api"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEDGER_PATH = REPO_ROOT / "state" / "metaculus-forecasts.json"
