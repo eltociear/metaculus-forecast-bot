@@ -65,6 +65,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# This file prints em-dashes and ANSI-labelled status lines. On a Windows console the default
+# stdout encoding is cp932/cp1252, which raises UnicodeEncodeError on the first such line and
+# crashes the whole validation mid-run (CI is UTF-8 and never hit this, so it hid on Linux).
+# Force UTF-8 so local `--validate`/dry runs on this box are reliable; a no-op where already UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forecast import (  # noqa: E402  - sibling module, path fixed just above
     build_cdf,
