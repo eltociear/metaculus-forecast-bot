@@ -11,9 +11,16 @@ market cap, and whether a named Atlantic cyclone is active. All on a 1-7 day hor
 Every one of those has a free, keyless, authoritative API — and it is the SAME source the
 question resolves against. Handing them to a language model with ten news headlines is the
 worst available method, and our own output showed it: for a one-day-ahead Lockheed Martin
-close the bot produced p5=550 / p95=620, a +/-6% interval on an instrument whose daily
-volatility is about 1%. Metaculus scores continuous questions on the whole distribution, so an
-interval several times too wide loses points on a question whose answer was fetchable.
+close the bot produced p5=550 / p95=620, centred near 585.
+
+⚠ The first version of this note called that "+/-6% on an instrument with ~1%/day volatility,
+four times too wide". That was an assumption, and measuring killed it: LMT's realised 60-day
+volatility is **2.10%/day**, so a correct one-day 90% band is about +/-3.4% and the model's
+width was under twice too wide, not four times. What the measurement DID expose is worse and
+was invisible while the width story was in the way — LMT last closed at **604.79**, so the
+model's centre sat ~3.3% BELOW spot and its p95 barely reached the current price. On a
+one-day horizon the centre is the whole forecast; a distribution in the wrong place cannot be
+rescued by having the right width. That is why every price family here anchors on spot.
 
 What this module does NOT do is pretend to know things it cannot. It returns None for anything
 outside the families it can source, and the LLM path handles those unchanged.
@@ -24,6 +31,7 @@ import json
 import math
 import re
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -146,6 +154,22 @@ def btc_history(days=60) -> list:
     return [p[1] for p in d.get("prices", [])]
 
 
+def equity_closes(symbol: str, rng="3mo") -> list:
+    """Daily closes for a listed symbol, keyless.
+
+    Stooq — the obvious choice — serves a JavaScript wall to a plain client, so its CSV never
+    arrives. Yahoo's chart endpoint answers without a key and carries the meta we need
+    (currency, exchange) to notice if a ticker resolves somewhere unexpected.
+    """
+    d = _get(f"https://query1.finance.yahoo.com/v8/finance/chart/"
+             f"{urllib.parse.quote(symbol)}?range={rng}&interval=1d")
+    res = (d.get("chart") or {}).get("result") or []
+    if not res:
+        return []
+    q = (res[0].get("indicators") or {}).get("quote") or [{}]
+    return [c for c in (q[0].get("close") or []) if c]
+
+
 # --------------------------------------------------------------------------- hurricanes
 
 
@@ -239,6 +263,38 @@ def quant_forecast(question: dict):
         return ("percentiles", lognormal_percentiles(spot, sigma),
                 f"BTC spot ${spot:,} anchored, realised 60d vol {vol*100:.2f}%/day, "
                 f"sqrt({max(1,lead)}d) -> sigma {sigma*100:.2f}%")
+
+    # --- listed equity close --------------------------------------------------------------
+    # Company -> ticker, spelled out rather than guessed. A ticker inferred from prose is how
+    # you end up confidently forecasting the wrong instrument, which is worse than abstaining;
+    # anything not on this list falls through to the model.
+    EQUITIES = {
+        "lockheed martin": "LMT", "boeing": "BA", "nvidia": "NVDA", "apple": "AAPL",
+        "microsoft": "MSFT", "tesla": "TSLA", "amazon": "AMZN", "alphabet": "GOOGL",
+        "meta platforms": "META", "palantir": "PLTR", "rtx": "RTX",
+        "northrop grumman": "NOC", "general dynamics": "GD",
+    }
+    if qtype in ("numeric", "discrete") and ("stock price" in low or "share price" in low
+                                             or "close at" in low or "closing price" in low):
+        for company, sym in EQUITIES.items():
+            if company not in low:
+                continue
+            closes = equity_closes(sym)
+            vol = realised_vol(closes)
+            if not closes or not vol:
+                return None
+            spot = closes[-1]
+            # Trading days, not calendar days: a Friday question resolving Monday is ONE
+            # session of risk, not three. Overstating the horizon inflates the spread by
+            # sqrt(3) and hands away points on exactly the weekend questions.
+            sessions = max(1, sum(1 for i in range(1, lead + 1)
+                                  if (datetime.now(timezone.utc).date()
+                                      + timedelta(days=i)).weekday() < 5))
+            sigma = vol * math.sqrt(sessions)
+            return ("percentiles", lognormal_percentiles(spot, sigma),
+                    f"{sym} last close ${spot:,.2f} anchored, realised 60d vol "
+                    f"{vol*100:.2f}%/day over {sessions} trading session(s) -> "
+                    f"sigma {sigma*100:.2f}%")
 
     return None
 
