@@ -745,16 +745,53 @@ def build_prompt(question: dict, research: str = "") -> tuple[str, str]:
     return BINARY_TEMPLATE.format(**common), qtype
 
 
+def salvage_percentiles(prompt: str, truncated: str) -> dict | None:
+    """Recover the percentile ladder when a run reasoned past its token budget.
+
+    A reasoning model handed a numeric question spends the whole budget doing arithmetic
+    longhand — least-squares fits, residuals, year-over-year tables — and gets cut off
+    mid-sentence before it ever reaches the summary block. `parse_percentiles` then
+    returns None, the run is discarded as "unparseable", and with all 3 runs failing the
+    same way the question is forfeited. Measured on Summer FutureEval question 45199,
+    which closed unforecast in a $50,000 tournament for exactly this reason.
+
+    The analysis in that output is usually fine; only the last eight lines are missing.
+    So hand the model its own work back and ask for nothing but the ladder. This is the
+    real fix — raising the budget alone just moves the cliff.
+    """
+    ask = ("You were part-way through a forecast when your output was cut off.\n\n"
+           f"--- the question and required format ---\n{prompt[-1100:]}\n\n"
+           f"--- your analysis so far ---\n{truncated[-3500:]}\n\n"
+           "Finish now. Output ONLY the eight lines, bare numbers, no commas, no units, "
+           "strictly increasing, nothing else:\n"
+           "Percentile 5:\nPercentile 10:\nPercentile 20:\nPercentile 40:\n"
+           "Percentile 60:\nPercentile 80:\nPercentile 90:\nPercentile 95:")
+    # 2000, not the few hundred tokens eight short lines actually occupy. "Output ONLY the
+    # eight lines" does not stop a reasoning model reasoning — it re-derives the whole fit
+    # first and only then prints them. Measured on this exact prompt: at 400 and at 1200
+    # tokens the reply is still mid-arithmetic and parses to None; at 2000 it returns the
+    # bare ladder and nothing else. Budgeting for the visible answer rather than for the
+    # thinking in front of it is the same mistake that lost the question in the first place.
+    try:
+        return parse_percentiles(call_llm(ask, temperature=0.2, max_tokens=2000))
+    except Exception:  # noqa: BLE001 - salvage is best-effort; the caller already failed
+        return None
+
+
 def forecast_question(question: dict, runs: int, research: str = "", verbose: bool = True):
     """Run an ensemble and aggregate. Returns (forecast, question_type, rationales)."""
     prompt, qtype = build_prompt(question, research)
     options = question.get("options") or []
     samples: list = []
     rationales: list[str] = []
+    # Numeric answers carry eight numbers behind a wall of arithmetic, so they need far
+    # more room than a binary "Probability: NN%". The shared 1400 default was enough for
+    # binary and silently short for numeric.
+    budget = 3000 if qtype in ("numeric", "discrete") else 1400
 
     for i in range(runs):
         try:
-            text = call_llm(prompt, temperature=0.3 + 0.1 * i)
+            text = call_llm(prompt, temperature=0.3 + 0.1 * i, max_tokens=budget)
         except NoLLMBackend as e:
             raise
         except RateLimited:
@@ -776,6 +813,10 @@ def forecast_question(question: dict, runs: int, research: str = "", verbose: bo
             parsed = parse_option_probabilities(text, options)
         elif qtype in ("numeric", "discrete"):
             parsed = parse_percentiles(text)
+            if parsed is None and text.strip():
+                parsed = salvage_percentiles(prompt, text)
+                if parsed is not None and verbose:
+                    print(f"    run {i + 1}/{runs}: ladder salvaged from truncated reasoning")
         else:
             parsed = None
 
@@ -932,6 +973,16 @@ def load_ledger() -> dict:
 def save_ledger(ledger: dict) -> None:
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     LEDGER_PATH.write_text(json.dumps(ledger, indent=1, sort_keys=True), encoding="utf-8")
+
+
+def ledger_has_submission(ledger: dict, question_id) -> bool:
+    """Did we already SUBMIT this question, according to our own committed ledger?
+
+    Only `submitted: true` counts — dry runs are recorded too, and treating one as done
+    would skip a question we never actually answered.
+    """
+    entry = (ledger.get("forecasts") or {}).get(str(question_id))
+    return bool(entry and entry.get("submitted"))
 
 
 # --------------------------------------------------------------------------- modes
@@ -1212,11 +1263,6 @@ def run_tournament(tournament, runs: int, submit: bool, limit: int, comment: boo
         question = post.get("question")
         if not question or question.get("status") != "open":
             continue
-        # Pace ourselves. A season is 300-500 questions and each costs several API calls;
-        # going flat out earns a Cloudflare 429 and loses questions outright, which is far
-        # more expensive than a second per question.
-        if counters["forecast"] or counters["skipped_done"]:
-            time.sleep(1)
         post_id, question_id = post["id"], question["id"]
         qtype = question.get("type", "binary")
         title = question.get("title", "")
@@ -1227,6 +1273,26 @@ def run_tournament(tournament, runs: int, submit: bool, limit: int, comment: boo
                   "than abstaining)")
             counters["skipped_numeric"] += 1
             continue
+
+        # Fast path off our own committed ledger. Proving "already forecast" through the API
+        # costs a get_post_details call AND the 1s pacing sleep below, for every already-done
+        # question, on every run. Measured: that was ~50s of the 140s an average run took,
+        # and the run does it 18 times a day to re-learn something it wrote down itself.
+        #
+        # Safe because the ledger only records actual submissions, and because it is not the
+        # only check: coverage.py re-derives coverage from the API without consulting it, so
+        # drift shows up in the blitz as an UNFORECAST count rather than hiding here.
+        if ledger_has_submission(ledger, question_id):
+            print("    skip: already forecast (ledger)")
+            counters["skipped_done"] += 1
+            continue
+
+        # Pace ourselves, but only in front of an actual API call. A season is 300-500
+        # questions and each costs several API calls; going flat out earns a Cloudflare 429
+        # and loses questions outright, which is far more expensive than a second per
+        # question.
+        if counters["forecast"] or counters["skipped_done"]:
+            time.sleep(1)
 
         try:
             details = get_post_details(post_id)
