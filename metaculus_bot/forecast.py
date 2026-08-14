@@ -782,6 +782,41 @@ def forecast_question(question: dict, runs: int, research: str = "", verbose: bo
     """Run an ensemble and aggregate. Returns (forecast, question_type, rationales)."""
     prompt, qtype = build_prompt(question, research)
     options = question.get("options") or []
+
+    # Some questions are not opinions. MiniBench's are auto-generated from public data sources,
+    # so for a handful of families the number the question resolves against is simply
+    # fetchable — the NWS forecast for a Central Park temperature, the NWS precipitation
+    # probability, a spot price plus its measured volatility. Asking a language model to guess
+    # those instead is how we produced a +/-6% interval for a one-day-ahead stock close.
+    #
+    # quant_forecast matches narrowly and returns None for everything else, so this can only
+    # ever replace a guess with a measurement, never the other way round.
+    try:
+        from quant import quant_forecast  # noqa: PLC0415 - optional, never fatal
+        hit = quant_forecast(question)
+    except Exception as e:  # noqa: BLE001 - a data-source outage must fall back to the LLM
+        hit = None
+        if verbose:
+            print(f"    quant unavailable ({type(e).__name__}); using the model")
+    if hit:
+        kind, value, why = hit
+        if kind == "probability" and qtype == "binary":
+            if verbose:
+                print(f"    \033[32mquant\033[0m {value:.1%}  ({why})")
+            return float(value), qtype, [f"quantitative source: {why}"]
+        if kind == "percentiles" and qtype in ("numeric", "discrete"):
+            cdf = build_cdf(value, question)
+            if cdf is not None:
+                if verbose:
+                    print(f"    \033[32mquant\033[0m " +
+                          "  ".join(f"p{int(p)}={v:g}" for p, v in sorted(value.items())))
+                    print(f"      ({why})")
+                return ({"cdf": cdf, "percentiles": value}, qtype,
+                        [f"quantitative source: {why}"])
+            if verbose:
+                # the scale rejected it — say so rather than silently falling through, or a
+                # broken bound would look like the source simply not matching
+                print("    quant produced percentiles the question scale rejected; using the model")
     samples: list = []
     rationales: list[str] = []
     # Numeric answers carry eight numbers behind a wall of arithmetic, so they need far
