@@ -101,19 +101,29 @@ def load_env() -> None:
                 os.environ["METACULUS_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
 
 
-def my_forecast_state(post: dict) -> tuple[bool, datetime | None]:
-    """(has a live forecast, when it was made).
+def my_forecast_state(post: dict) -> tuple[bool | None, datetime | None]:
+    """(has a live forecast, when the next window opens). `None` = we could not tell.
 
     Costs one request per question, and that is not avoidable: `my_forecasts` is **absent
     from the list response entirely**  - not empty, absent  - so reading coverage off the list
     scores every question as unforecast and reports a confident 0%. It is only on
     `/posts/{id}/`. Same shape of trap as Apify's run list omitting chargedEventCounts.
+
+    笞 Tri-state, not bool. This returned False on a network failure, with the comment "a
+    read failure must not be scored as forecast"  - which dodged the false negative and
+    created a false positive instead: one timed-out fetch became an UNFORECAST, and the
+    blitz lit `ACTIONABLE: 1 unforecast question in a funded tournament - an unanswered
+    question scores zero while rivals bank points`. Measured 2026-08-17: the blitz run
+    reported Market Pulse 10/11 with the leaderboard also `unreadable (?)`  - the same
+    outage  - and a re-run 3 minutes later read 11/11 with nothing submitted in between.
+    A failed read is an UNKNOWN. The caller already has that bucket, and it is already
+    excluded from the gap count; it just was never reachable from here.
     """
     pid = post.get("id")
     try:
         detail = _request(f"{API_BASE_URL}/posts/{pid}/", headers=metaculus_headers())
-    except Exception:  # noqa: BLE001 - a read failure must not be scored as "forecast"
-        return False, None
+    except Exception:  # noqa: BLE001 - unreadable, which is neither forecast nor a gap
+        return None, None
     subs, next_open = live_sub_questions(detail)
     if not subs:
         # Nothing forecastable in this post right now  - not a gap. Either it is an
@@ -161,6 +171,24 @@ def leaderboard(tid, numeric_id=None) -> str:
     raw = board.get("entries") or []
     if not raw:
         return "board not computed yet (0 entries)"
+
+    # ⚠ A board is a SNAPSHOT, and Metaculus recomputes each one on its own clock. Measured
+    # 2026-08-17: Cup 6h old, Summer 13h, Market Pulse 109h, Animal Futures **258h** — and
+    # this line was printing "not on the board" for Animal every run as though it were a live
+    # verdict on us. It was a statement about 2026-08-06, before most of our forecasts even
+    # existed. An absence in a stale snapshot is not an absence. Stamp the age onto every
+    # standing so the reader can tell "we are losing" from "nobody has counted yet".
+    calc = sorted(e.get("calculated_on") for e in raw if e.get("calculated_on"))
+    age_txt = ""
+    if calc:
+        try:
+            age_h = ((datetime.now(timezone.utc)
+                      - datetime.fromisoformat(calc[-1].replace("Z", "+00:00")))
+                     .total_seconds() / 3600)
+            age_txt = (f" [board computed {age_h:.0f}h ago"
+                       + ("  - TOO STALE TO CONCLUDE FROM" if age_h > 48 else "") + "]")
+        except Exception:  # noqa: BLE001
+            age_txt = " [board age unreadable]"
     # A board mixes competitors with aggregation rows (user=null), Metaculus' own house bots
     # (metac-*), research-only entries and secondary bots from one operator. On FutureEval
     # that is 79 of 199 rows. Counting them makes the field look bigger and our odds worse,
@@ -178,9 +206,17 @@ def leaderboard(tid, numeric_id=None) -> str:
         e = mine[0]
         return (f"\033[32mrank {e.get('rank')} of {len(entries)}\033[0m, "
                 f"score {e.get('score')}, on track for ${e.get('prize') or 0:.2f} "
-                f"({len(paid)} of {len(entries)} are paid{floor})")
+                f"({len(paid)} of {len(entries)} are paid{floor}){age_txt}")
+    # Present but prize-excluded is a different fact from absent, and only one of them is
+    # about our forecasting. Say which.
+    excl = [e for e in raw if (e.get("user") or {}).get("id") == OUR_USER_ID]
+    if excl:
+        e = excl[0]
+        return (f"\033[33mon the board but PRIZE-EXCLUDED\033[0m (exclusion_status="
+                f"{e.get('exclusion_status')}), rank {e.get('rank')} of {len(raw)} rows, "
+                f"{e.get('contribution_count')} scored{age_txt}")
     return (f"\033[33mnot on the board\033[0m  - {len(entries)} eligible entrants "
-            f"(of {len(raw)} rows), {len(paid)} paid{floor}{bar}")
+            f"(of {len(raw)} rows), {len(paid)} paid{floor}{bar}{age_txt}")
 
 
 def brief(post: dict) -> None:
@@ -366,6 +402,10 @@ def main() -> int:
         fresh.sort(key=lambda p: (hours_left(p) is None, hours_left(p) or 1e9))
 
         done, missing, unknown, opens_at = list(known), [], [], None
+        # Subset of `unknown` that we DID spend budget on and still could not read. Kept
+        # apart so the report can say "the API failed" instead of "the budget ran out"  -
+        # they need opposite responses (retry vs. --full).
+        unread = []
         # Only posts with NOTHING left to open may be cached as settled. A Market Pulse post
         # holds staggered biweekly subquestions, so "covered" today can become "a new gap" on
         # its next window without the post ever changing. Caching those would make the tool
@@ -381,6 +421,11 @@ def main() -> int:
             has, nxt = my_forecast_state(p)
             if nxt is not None:
                 opens_at = nxt if opens_at is None else min(opens_at, nxt)
+            if has is None:
+                # The fetch failed. Unknown  - never a gap, never covered, never cached.
+                unread.append(p)
+                unknown.append(p)
+                continue
             (done if has else missing).append(p)
             if has and nxt is None:
                 settled.append(p)
@@ -415,10 +460,14 @@ def main() -> int:
             hrs = (opens_at - datetime.now(timezone.utc)).total_seconds() / 3600
             print(f"  \033[36mnext forecasting window opens {opens_at:%Y-%m-%d %H:%M}Z "
                   f"({hrs:.0f}h)\033[0m  - nothing is forecastable before then")
-        if unknown:
-            print(f"  \033[33mUNKNOWN: {len(unknown)}\033[0m  - the {budget_started_at}-question "
-                  f"detail budget ran out, so these were never checked. They are NOT counted "
-                  f"as covered. Re-run with --full to settle them.")
+        if len(unknown) > len(unread):
+            print(f"  \033[33mUNKNOWN: {len(unknown) - len(unread)}\033[0m  - the "
+                  f"{budget_started_at}-question detail budget ran out, so these were never "
+                  f"checked. They are NOT counted as covered. Re-run with --full to settle them.")
+        if unread:
+            print(f"  \033[33mUNREADABLE: {len(unread)}\033[0m  - the detail fetch FAILED for "
+                  f"these (API error/timeout). Not a gap and not covered  - re-run to settle. "
+                  f"Ids: {', '.join(str(p.get('id')) for p in unread)}")
         standing = leaderboard(tid, numeric_id)
         print(f"  standing: {standing}")
 
@@ -453,6 +502,7 @@ def main() -> int:
             "forecastIds": [p.get("id") for p in settled],
             "missingIds": [p.get("id") for p in missing],
             "unknownIds": [p.get("id") for p in unknown],
+            "unreadableIds": [p.get("id") for p in unread],
             "missingClosingSoon": [
                 {"id": p.get("id"), "title": p.get("title"), "hoursLeft": round(hours_left(p) or -1, 1)}
                 for p in missing if (hours_left(p) or 1e9) < 72],
