@@ -132,10 +132,23 @@ def my_forecast_state(post: dict) -> tuple[bool | None, datetime | None]:
         return True, next_open
     # A group post is only covered when EVERY live subquestion is. Treating "any subquestion
     # forecast" as done would call a 6-part Market Pulse group complete after one.
+    # Which live subquestion is uncovered, recorded ON the post so the report can name it.
+    # This exists because the 10/11-then-11/11 incident in the docstring above happened a
+    # SECOND time on 2026-08-18 — Market Pulse read 4/11 with UNFORECAST 7, and a re-run
+    # minutes later read 11/11 with nothing submitted in between and no UNREADABLE line, so
+    # the tri-state was not involved. Checking by hand showed the forecasts had been placed
+    # 6.6 hours before EITHER run. Two sessions have now guessed at the cause from a bare
+    # count. A count cannot be checked against the server; a subquestion id can, in one
+    # request. Never diagnose this from the aggregate again.
+    gaps = []
     for q in subs:
         latest = ((q.get("my_forecasts") or {}).get("latest")) or {}
         if latest.get("forecast_values") is None:
-            return False, next_open
+            gaps.append(f"q{q.get('id')}"
+                        + (f" '{str(q.get('label'))[:24]}'" if q.get("label") else ""))
+    if gaps:
+        post["_uncovered_subs"] = gaps
+        return False, next_open
     return True, next_open
 
 
@@ -479,6 +492,10 @@ def main() -> int:
                 h = hours_left(p)
                 hh = f"{h:6.1f}h" if h is not None else "     ?"
                 print(f"    {hh}  [{p.get('id')}] {(p.get('title') or '')[:78]}")
+                # Name the subquestion, not just the post. On a group post the post id alone
+                # is unverifiable — it holds six windows and the report never said which one.
+                if p.get("_uncovered_subs"):
+                    print(f"             uncovered: {', '.join(p['_uncovered_subs'][:6])}")
         if missing and show_brief:
             print(f"\n--- full briefs for the {len(missing)} unforecast question(s), "
                   f"closing soonest first ---")
@@ -493,6 +510,10 @@ def main() -> int:
             "open": len(posts), "forecast": len(done), "unforecast": len(missing),
             "unknown": len(unknown), "checked": checked,
             "coveragePct": pct,
+            # The evidence behind `unforecast`, so a disputed count can be checked against
+            # the server instead of re-run and argued about. See my_forecast_state.
+            "unforecastSubs": {str(p.get("id")): p.get("_uncovered_subs") or []
+                               for p in missing},
             # Persisted so the blitz can show it without re-fetching, and so "we appeared on
             # a board" is visible as a CHANGE rather than something you have to notice.
             "standing": _strip_ansi(standing), "botStatus": status,
