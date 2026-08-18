@@ -124,6 +124,12 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 # is the backend that keeps the bot alive while HF's free tier is depleted (canPay:false until
 # ~2026-09-01) — no operator email, no USDC, no HF quota. Override with BLOCKRUN_MODEL.
 BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
+# Attempts per blockrun call, and the backoff step between them. Blockrun's failures are blips
+# (429/524 seconds apart from a wallet that is not quota-limited), so a handful of short waits
+# recovers the call; the cap keeps a genuinely down backend from wedging a whole tournament run
+# at ~30s per question. Worst case per call: 3 + 6 = 9s of waiting before falling through.
+BLOCKRUN_ATTEMPTS = 3
+BLOCKRUN_BACKOFF = 3
 
 
 # --------------------------------------------------------------------------- env
@@ -278,15 +284,33 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
     if blockrun_key:
         try:
             from blockrun_llm import LLMClient  # noqa: E402 - optional backend, imported lazily
-            text = LLMClient(private_key=blockrun_key).chat(
-                BLOCKRUN_MODEL, prompt, temperature=temperature, max_tokens=max_tokens)
-            if text and text.strip():
-                return text
-            print("    blockrun returned empty; falling through to HF")
         except ImportError:
             pass  # SDK not installed here; use HF
-        except Exception as e:  # noqa: BLE001 - any backend error: fall through to HF
-            print(f"    blockrun unusable ({type(e).__name__}): {str(e)[:120]}")
+        else:
+            # blockrun is not rate-exhausted, it is FLAKY: measured 2026-08-18, the same wallet
+            # and model answered a probe in 1.1s while the very next real call returned 429, and
+            # a third returned 524 (a Cloudflare gateway timeout, not a quota at all). With no
+            # retry here, one such blip fell straight through to HF — whose free tier is depleted
+            # until ~2026-09-01 and 402s — so the question was skipped as "rate-limited" and a
+            # 3.0h FutureEval window closed unanswered. A scored zero, from a blip that clears in
+            # seconds. So spend a few bounded seconds retrying the SAME call before giving up on
+            # the only backend that currently works.
+            client = LLMClient(private_key=blockrun_key)
+            for attempt in range(BLOCKRUN_ATTEMPTS):
+                try:
+                    text = client.chat(BLOCKRUN_MODEL, prompt,
+                                       temperature=temperature, max_tokens=max_tokens)
+                    if text and text.strip():
+                        return text
+                    print("    blockrun returned empty; falling through to HF")
+                    break
+                except Exception as e:  # noqa: BLE001 - any backend error: retry, then fall through
+                    transient = any(code in str(e) for code in ("429", "500", "502", "503", "504", "524"))
+                    if transient and attempt + 1 < BLOCKRUN_ATTEMPTS:
+                        time.sleep(BLOCKRUN_BACKOFF * (attempt + 1))
+                        continue
+                    print(f"    blockrun unusable ({type(e).__name__}): {str(e)[:120]}")
+                    break
 
     # Both tokens, in preference order. This used to read `A or B`, so B was only ever a
     # default for when A was unset, never a fallback for when A stopped working. They turn
