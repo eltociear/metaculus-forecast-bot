@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -143,6 +144,7 @@ def main() -> int:
 
     ledger = load_ledger()
     ok = failed = skipped = 0
+    unreachable: list[str] = []
     now = datetime.now(timezone.utc)
     for key, entry in plan.items():
         if key.startswith("_"):         # "_note" and friends are documentation, not work
@@ -152,7 +154,28 @@ def main() -> int:
         # only to keep sibling windows of the same post apart. Without this a group post could
         # carry exactly one queued forecast, which is one window out of six.
         post_id = key.split("#", 1)[0]
-        details = get_post_details(int(post_id))
+        # One unguarded call used to abort the WHOLE queue. Measured 2026-08-18: a single
+        # `RemoteDisconnected` on post 44535 killed the run, and every entry after it in the
+        # file — prepared forecasts on a $7,500 tournament, several with an open window —
+        # was never reached. The queue is processed by a three-hourly cron, so the failure is
+        # silent and repeats. A network blip must cost one post, never the batch: retry it
+        # briefly, then skip that post and keep going. Same shape as the blockrun retry in
+        # forecast.py, which lost a 3.0h FutureEval window to one 429.
+        details = None
+        for attempt in range(3):
+            try:
+                details = get_post_details(int(post_id))
+                break
+            except Exception as e:  # noqa: BLE001 - transport or HTTP, both retryable here
+                if attempt == 2:
+                    print(f"\n[{post_id}] \033[31mUNREACHABLE\033[0m after 3 tries "
+                          f"({type(e).__name__}: {str(e)[:70]}) — skipped, NOT failed. "
+                          f"The rest of the queue still runs.")
+                    unreachable.append(post_id)
+                    break
+                time.sleep(2 * (attempt + 1))
+        if details is None:
+            continue
         title = (details.get("title") or "")[:70]
         want = entry.get("question_id")
         if want:
@@ -278,7 +301,12 @@ def main() -> int:
     # "submitted 29" for a run that submitted nothing is the same class of false label this
     # repo spent a day removing from its own instruments.
     verb = "validated" if validate_only else "submitted"
-    print(f"\n=== {verb} {ok}, failed {failed}, skipped {skipped} ===")
+    print(f"\n=== {verb} {ok}, failed {failed}, skipped {skipped}"
+          + (f", unreachable {len(unreachable)}" if unreachable else "") + " ===")
+    if unreachable:
+        # Never let a skipped post read as a clean run: it is queued work that did NOT go out.
+        print(f"\033[33m{len(unreachable)} post(s) could not be read this run and were "
+              f"passed over: {', '.join(unreachable)}. Re-run — they are still queued.\033[0m")
     return 1 if failed else 0
 
 
