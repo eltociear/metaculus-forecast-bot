@@ -130,6 +130,16 @@ BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
 # at ~30s per question. Worst case per call: 3 + 6 = 9s of waiting before falling through.
 BLOCKRUN_ATTEMPTS = 3
 BLOCKRUN_BACKOFF = 3
+# ⚠ The cap above bounds the number of ATTEMPTS; it never bounded the time PER attempt, and that
+# is what wedged the local 15-minute cron for ~7 hours on 2026-08-24. The blockrun_llm SDK's
+# LLMClient defaults to timeout=600.0 — ten minutes — and we were constructing it with no override,
+# so a backend that ACCEPTS the connection and then never responds (a hang, not a 429/524 that
+# returns) blocked client.chat() for up to 600s per call. mm_cron.ps1 fires every 900s, so one or
+# two hung questions and the task never finishes, never logs, and its own trap never runs. 90s is
+# ample for a real gpt-oss-120b completion and keeps even a fully-hung minibench run (≈7 new
+# questions) under the 900s window; a slow completion lost to it is retried next run, which a
+# 7-hour silent wedge is not.
+BLOCKRUN_TIMEOUT = 90
 
 
 # --------------------------------------------------------------------------- env
@@ -295,7 +305,7 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
             # 3.0h FutureEval window closed unanswered. A scored zero, from a blip that clears in
             # seconds. So spend a few bounded seconds retrying the SAME call before giving up on
             # the only backend that currently works.
-            client = LLMClient(private_key=blockrun_key)
+            client = LLMClient(private_key=blockrun_key, timeout=BLOCKRUN_TIMEOUT)
             for attempt in range(BLOCKRUN_ATTEMPTS):
                 try:
                     text = client.chat(BLOCKRUN_MODEL, prompt,
@@ -305,11 +315,21 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
                     print("    blockrun returned empty; falling through to HF")
                     break
                 except Exception as e:  # noqa: BLE001 - any backend error: retry, then fall through
-                    transient = any(code in str(e) for code in ("429", "500", "502", "503", "504", "524"))
+                    msg = str(e)
+                    # A hang that hit BLOCKRUN_TIMEOUT will not clear in a few seconds of backoff,
+                    # and every retry spends another timeout against the 900s cron window. So a
+                    # timeout falls through immediately; only a fast-returning blip (429/524…)
+                    # is worth retrying.
+                    is_timeout = ("timeout" in type(e).__name__.lower()
+                                  or "timed out" in msg.lower() or "timeout" in msg.lower())
+                    transient = any(code in msg for code in ("429", "500", "502", "503", "504", "524"))
+                    if is_timeout:
+                        print(f"    blockrun timed out after {BLOCKRUN_TIMEOUT}s; falling through")
+                        break
                     if transient and attempt + 1 < BLOCKRUN_ATTEMPTS:
                         time.sleep(BLOCKRUN_BACKOFF * (attempt + 1))
                         continue
-                    print(f"    blockrun unusable ({type(e).__name__}): {str(e)[:120]}")
+                    print(f"    blockrun unusable ({type(e).__name__}): {msg[:120]}")
                     break
 
     # Both tokens, in preference order. This used to read `A or B`, so B was only ever a
