@@ -128,20 +128,31 @@ BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
 # (429/524 seconds apart from a wallet that is not quota-limited), so a handful of short waits
 # recovers the call; the cap keeps a genuinely down backend from wedging a whole tournament run
 # at ~30s per question. Worst case per call: 3 + 6 = 9s of waiting before falling through.
-BLOCKRUN_ATTEMPTS = 3
-BLOCKRUN_BACKOFF = 3
-# ⚠ A 429 IS NOT A BLIP, and treating it as one is what the comment above got wrong. Measured
-# 2026-08-28 from the Actions log: on 2026-08-26 EIGHT of fifteen cloud runs failed, every one
-# with "blockrun unusable (APIError): API error: 429" followed by HF depleted. Three attempts
-# 3s and 6s apart span nine seconds; a free-tier rate window is minutes. A 5xx is a blip and
-# keeps the short backoff; a 429 gets a longer one.
-BLOCKRUN_429_BACKOFF = 12
-# And a rate window is a property of the WINDOW, not of the call: if the first question of a run
-# is still 429 after its retries, every later question in the same run will be too. Latch it and
-# fall through immediately instead of spending the cron window knocking on a closed door - that
-# LOSES time rather than buying any, which is why the latch and the longer backoff arrive
-# together rather than trading against each other.
-_BLOCKRUN_RATE_LIMITED = False
+# ⚠⚠ MEASURED 2026-08-28, and it reversed the fix written earlier the same day.
+# That fix assumed a 429 was a RATE WINDOW and responded by waiting longer (12s, 24s) and then
+# latching the backend off for the rest of the run. Both halves were wrong. Probing the live
+# endpoint with a one-token prompt, 18 calls two seconds apart, returned:
+#
+#     4 4 4 4 4 4 4 4 4 4 4 O 4 4 4 O 4 4      -> 2/18 = 11% per-call success
+#
+# The successes are isolated, not clustered: blockrun's free tier rejects most individual calls
+# and clears within seconds. It is not a window to wait out, it is a coin that lands 1-in-9. So
+# waiting longer buys nothing and latching off throws away the very next call that would have
+# worked. What the arithmetic actually says, at an 11% per-call rate:
+#
+#     3 attempts -> 70% chance the question is lost      (this was the setting)
+#    20 attempts -> 9.5% chance, ~40s worst case
+#
+# 70% matches the observed damage: 28 of 60 scheduled cloud runs failed over 2026-08-24..27, and
+# 8 of 8 sampled failures were this exact signature (429 x3, then HF depleted). So: many short
+# attempts, a FLAT wait because independent rejections have no window to escalate against, and a
+# wall-clock budget as the real bound rather than an attempt count.
+BLOCKRUN_ATTEMPTS = 20
+BLOCKRUN_BACKOFF = 2          # flat; there is no window to back off from
+# Expected cost is ~9 attempts, about 18s per question, not the worst case. The budget below is
+# what stops a genuinely-dead backend from eating the 900s local cron window: at ~7 questions a
+# run, 60s each caps the whole run's retrying at ~7 minutes.
+BLOCKRUN_BUDGET_S = 60
 # ⚠ The cap above bounds the number of ATTEMPTS; it never bounded the time PER attempt, and that
 # is what wedged the local 15-minute cron for ~7 hours on 2026-08-24. The blockrun_llm SDK's
 # LLMClient defaults to timeout=600.0 — ten minutes — and we were constructing it with no override,
@@ -302,11 +313,8 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
     # is what actually forecasts during the outage — no operator email, no USDC, no HF quota.
     # Reuses the on-chain wallet key we already hold. On any failure (SDK missing, network,
     # model EOL) it falls through to HF rather than aborting the run.
-    global _BLOCKRUN_RATE_LIMITED
     blockrun_key = os.getenv("BLOCKRUN_WALLET_KEY") or os.getenv("BASE_WALLET_PRIVATE_KEY")
-    if blockrun_key and _BLOCKRUN_RATE_LIMITED:
-        print("    blockrun rate-limited earlier this run; not retrying it per question")
-    elif blockrun_key:
+    if blockrun_key:
         try:
             from blockrun_llm import LLMClient  # noqa: E402 - optional backend, imported lazily
         except ImportError:
@@ -321,6 +329,7 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
             # seconds. So spend a few bounded seconds retrying the SAME call before giving up on
             # the only backend that currently works.
             client = LLMClient(private_key=blockrun_key, timeout=BLOCKRUN_TIMEOUT)
+            _br_started = time.time()
             for attempt in range(BLOCKRUN_ATTEMPTS):
                 try:
                     text = client.chat(BLOCKRUN_MODEL, prompt,
@@ -341,19 +350,15 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
                     if is_timeout:
                         print(f"    blockrun timed out after {BLOCKRUN_TIMEOUT}s; falling through")
                         break
-                    rate_limited = "429" in msg
-                    if transient and attempt + 1 < BLOCKRUN_ATTEMPTS:
-                        step = BLOCKRUN_429_BACKOFF if rate_limited else BLOCKRUN_BACKOFF
-                        time.sleep(step * (attempt + 1))
+                    spent = time.time() - _br_started
+                    if (transient and attempt + 1 < BLOCKRUN_ATTEMPTS
+                            and spent < BLOCKRUN_BUDGET_S):
+                        time.sleep(BLOCKRUN_BACKOFF)
                         continue
-                    if rate_limited:
-                        # Survived every retry: this is a window, not a blip. Say so, and stop
-                        # paying for it once per question for the rest of the run.
-                        _BLOCKRUN_RATE_LIMITED = True
-                        print(f"    blockrun RATE-LIMITED after {BLOCKRUN_ATTEMPTS} attempts over "
-                              f"~{BLOCKRUN_429_BACKOFF * 3}s; latched off for the rest of this run")
-                    else:
-                        print(f"    blockrun unusable ({type(e).__name__}): {msg[:120]}")
+                    why = (f"{attempt + 1} attempts in {spent:.0f}s"
+                           + ("" if spent < BLOCKRUN_BUDGET_S
+                              else f" (hit the {BLOCKRUN_BUDGET_S}s budget)"))
+                    print(f"    blockrun unusable after {why} ({type(e).__name__}): {msg[:100]}")
                     break
 
     # Both tokens, in preference order. This used to read `A or B`, so B was only ever a
