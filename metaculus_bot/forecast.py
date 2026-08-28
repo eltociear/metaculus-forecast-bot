@@ -152,12 +152,21 @@ BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
 # independent draws at 11%% miss 9.8%% of the time - but it stopped 19s short of the 60s
 # budget, so the budget was doing nothing. At the same budget, ~28 attempts fit and the
 # residual falls to about 4%%. The budget, not the count, stays the real bound.
-BLOCKRUN_ATTEMPTS = 30
+BLOCKRUN_ATTEMPTS = 45
 BLOCKRUN_BACKOFF = 2          # flat; there is no window to back off from
 # Expected cost is ~9 attempts, about 18s per question, not the worst case. The budget below is
 # what stops a genuinely-dead backend from eating the 900s local cron window: at ~7 questions a
 # run, 60s each caps the whole run's retrying at ~7 minutes.
-BLOCKRUN_BUDGET_S = 60
+# 90s, not 60. Re-probed 2026-08-28 evening: 1/15 = 7% per-call success, WORSE than the 11%
+# measured that morning, so the rejection rate is persistent and drifts. At 7%, 30 attempts
+# still lose 12.6% of questions; 45 in a 90s budget lose 3.8%. Worst case is 90s x ~7
+# questions = 10.5 min, inside the 900s local cron window; EXPECTED cost is ~14 attempts,
+# about 28s a question.
+#
+# ⚠ Do not read the two successful runs of 2026-08-28 as proof this works. Both absorbed
+# ZERO 429s because every tournament had no open questions at the time, so no LLM call was
+# made at all. A green run that never exercised the path is not evidence about the path.
+BLOCKRUN_BUDGET_S = 90
 # ⚠ The cap above bounds the number of ATTEMPTS; it never bounded the time PER attempt, and that
 # is what wedged the local 15-minute cron for ~7 hours on 2026-08-24. The blockrun_llm SDK's
 # LLMClient defaults to timeout=600.0 — ten minutes — and we were constructing it with no override,
