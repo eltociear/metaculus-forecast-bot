@@ -147,7 +147,12 @@ BLOCKRUN_MODEL = os.getenv("BLOCKRUN_MODEL", "nvidia/gpt-oss-120b")
 # 8 of 8 sampled failures were this exact signature (429 x3, then HF depleted). So: many short
 # attempts, a FLAT wait because independent rejections have no window to escalate against, and a
 # wall-clock budget as the real bound rather than an attempt count.
-BLOCKRUN_ATTEMPTS = 20
+# 30, not 20: a dispatched run on 2026-08-28 printed "blockrun unusable after 20 attempts
+# in 41s" and lost its question. That is not a bug, it is the predicted residual - 20
+# independent draws at 11%% miss 9.8%% of the time - but it stopped 19s short of the 60s
+# budget, so the budget was doing nothing. At the same budget, ~28 attempts fit and the
+# residual falls to about 4%%. The budget, not the count, stays the real bound.
+BLOCKRUN_ATTEMPTS = 30
 BLOCKRUN_BACKOFF = 2          # flat; there is no window to back off from
 # Expected cost is ~9 attempts, about 18s per question, not the worst case. The budget below is
 # what stops a genuinely-dead backend from eating the 900s local cron window: at ~7 questions a
