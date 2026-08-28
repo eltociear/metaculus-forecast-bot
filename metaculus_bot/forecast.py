@@ -419,6 +419,18 @@ def call_llm(prompt: str, temperature: float = 0.4, max_tokens: int = 1400) -> s
                         time.sleep(3 * (attempt + 1))
                         continue
                     if e.code == 402:
+                        # ⚠ A 402 is a RATE WINDOW or a DEPLETION and the two need opposite
+                        # responses - the same mistake this file already made about blockrun's
+                        # 429. Measured 2026-08-28: a question that blockrun could not serve
+                        # then spent another 120s here waiting for a "window" to clear on an
+                        # account that cannot pay until 2026-09-01, taking one lost question to
+                        # 215s. whoami-v2 tells them apart for the cost of one call, cached.
+                        if _hf_can_pay(hf_token) is False:
+                            raise RateLimited(
+                                "HF 402 and whoami-v2 says canPay=false: this is DEPLETION, not "
+                                "a rate window, so not spending "
+                                f"{HF_402_MAX_WAITS * HF_402_BACKOFF_SECONDS}s waiting for it "
+                                "to clear. Set OPENROUTER_API_KEY to bypass HF.") from e
                         if hf_402_waits_left <= 0:
                             raise RateLimited(
                                 "HF 402 rate window did not clear within "
@@ -1297,6 +1309,26 @@ def _group_posts_dropped(tournament) -> int:
                    if (p.get("group_of_questions") or {}).get("questions"))
     except Exception:  # noqa: BLE001
         return 0
+
+
+_HF_CANPAY_CACHE: dict = {}
+
+
+def _hf_can_pay(token: str):
+    """One cached `whoami-v2` probe. True / False / None when it could not be asked.
+
+    Non-recursive on purpose: `backend_depleted()` answers the same question but confirms with
+    a real `call_llm`, so it cannot be used from inside `call_llm`.
+    """
+    if token in _HF_CANPAY_CACHE:
+        return _HF_CANPAY_CACHE[token]
+    try:
+        v = _request("https://huggingface.co/api/whoami-v2",
+                     headers={"Authorization": f"Bearer {token}"}).get("canPay")
+    except Exception:  # noqa: BLE001 - a failed probe is UNKNOWN, never "depleted"
+        v = None
+    _HF_CANPAY_CACHE[token] = v
+    return v
 
 
 def backend_depleted() -> str | None:
